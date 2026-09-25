@@ -50,14 +50,14 @@ def add_to_db(uploaded_files):
         chunk_size=800,
         chunk_overlap=120
     )
-#这就是“浏览器内存 → 磁盘路径 → 读 PDF → 切文档”的完整落地过程。
+
     for uploaded_file in uploaded_files:            #uploaded_file.name:是浏览器传来的原始文件名如: 报告.pdf
         #按文件内容算哈希:同一个文件传两次哈希相同，可据此判断是否已入库
         file_hash=hashlib.sha256(uploaded_file.getvalue()).hexdigest()
         if db.get(where={"file_hash":file_hash},limit=1)["ids"]:#查库里有没有这个哈希
             st.info(f"{uploaded_file.name} 已在库中，跳过")
             continue#跳过这个文件，不重复入库
-
+        #这就是“浏览器内存 → 磁盘路径 → 读 PDF → 切文档”的完整落地过程。
         #先把上传的文件落到本地目录，因为pypdfloader需要文件路径
         temp_file_path=os.path.join("./temp",uploaded_file.name)#浏览器内存里的文件」变成一个「磁盘上的路径字符串」
         os.makedirs(os.path.dirname(temp_file_path),exist_ok=True)#剥掉文件名，得到目录部分
@@ -83,7 +83,7 @@ def run_rag_chain(query):
 
     db=get_db()#拿到带缓存的数据库实例
     #把数据库包装成检索器：相似度检索，每次取相关的5个片段
-    retriever=db.as_retriever(search_type="similarity",search_kwargs={"k":5})
+    retriever=db.as_retriever(search_type="similarity",search_kwargs={"k":5})#kwargs给下层的参数口袋，langchain不管
 
     prompt_template=ChatPromptTemplate.from_template(
         """
@@ -126,9 +126,10 @@ def main():
         ":💡:输入你的关于文档的问题",
         placeholder="这是你的主要问题吗"
     )
-    if not query:
+    if st.button("提交"):
+     if not query:
         st.warning("请输入一个问题")
-    else:
+     else:
         with st.spinner("思考着..."): # 转圈提示，避免用户以为卡住了
             result=run_rag_chain(query=query)
             st.write(result)
