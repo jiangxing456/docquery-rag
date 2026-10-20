@@ -20,6 +20,10 @@ rag_db/
 chroma/
 *.sqlite3
 
+# 评测结果数据（不发布，本地运行评测脚本可复现）
+*.csv
+eval_results*.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

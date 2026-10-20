@@ -11,3 +11,7 @@ python-dotenv
 redis
 fakeredis
 numpy
+
+# 评测依赖（eval_*.py / hybrid_*.py / small2big_*.py 等评测脚本使用）
+ragas
+rank-bm25
