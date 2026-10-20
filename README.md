@@ -23,7 +23,7 @@ PDF → 文本解析 → 分块（800 字符，重叠 120）→ BGE-m3 向量化
 
 ## 评测与实验脚本
 
-这些脚本是离线实验，用来验证「混合检索、父子分块、Ragas 评测、缓存命中、拒答阈值」等能力，不参与 `app.py` 的线上流程。按用途分四组：
+这些脚本是离线实验，用来验证「混合检索（含 reranker 重排）、父子分块、Ragas 评测、缓存命中、拒答阈值」等能力，不参与 `app.py` 的线上流程。按用途分四组：
 
 **1. 评测数据集（golden set）**
 
@@ -65,9 +65,14 @@ streamlit run app.py
 评测脚本需要先配置 DeepSeek API Key（脚本里 `load_dotenv` 指向的 `.env` 路径是开发者本机路径，clone 后需改成自己的），并确认 `rag_db/` 里已有入库文档，然后按「检索生成 → Ragas 评测」两步运行，例如：
 
 ```bash
-python eval_retrieve.py       # 第一步：检索 + 生成，产出 eval_results.json
-python eval_ragas.py          # 第二步：Ragas 四指标评测
+python eval_retrieve.py       # baseline：纯向量检索 + 生成，产出 eval_results.json
+python eval_ragas.py          # Ragas 四指标评测
+
+python hybrid_eval.py         # 混合检索 + bge-reranker 精排 + 生成，产出 eval_results_hybrid.json
+python hybrid_ragas.py        # Ragas 四指标评测
 ```
+
+跑 `hybrid_eval.py` 需要先下载 `BAAI/bge-reranker-base` 精排模型（脚本走 hf-mirror 镜像自动下载，约 1.1GB）。
 
 ## 当前限制
 

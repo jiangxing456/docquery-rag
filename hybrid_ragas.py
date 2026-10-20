@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""评测第二步：读 eval_results_hybrid.json，用 Ragas 跑四个指标。
+"""评测第二步：读 hybrid_eval.py（混合检索 + bge-reranker 重排）产出的 eval_results_hybrid.json，用 Ragas 跑四个指标。
 
 指标说明：
 - faithfulness       答案是否忠实于检索到的上下文（有没有编造）
