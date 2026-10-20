@@ -40,7 +40,7 @@ PDF → 文本解析 → 分块（800 字符，重叠 120）→ BGE-m3 向量化
 第一步检索 Top-5 上下文并生成答案，产出 `eval_results*.json`：
 
 - `eval_retrieve.py` / `eval_retrieve_decoupling.py` —— baseline 纯向量检索。
-- `hybrid_eval.py` —— 混合检索（BM25 + 向量，RRF 融合两路排名）。
+- `hybrid_eval.py` —— 混合检索（BM25 + 向量，RRF 融合 + bge-reranker 精排）。
 - `small2big_eval.py` —— 子块精确检索 → 找回父块全文做上下文生成答案。
 
 第二步读上一步的 JSON，用 Ragas 跑四个指标（faithfulness / context_recall / answer_relevancy / context_precision）：
