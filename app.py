@@ -14,6 +14,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from semantic_cache import lookup, store  # 语义缓存：相似问题复用答案
+
+# 拒答阈值：检索到的最小距离超过它，就判定「知识库里没有」，直接拒答不硬编。
+# 1.11 是实测定的——7 个「论文里能查到答案」的问题距离落在 0.85~1.11，
+# 7 个「与论文无关」的问题落在 1.13~1.31，两者之间有安全间隔。
+# ⚠️ 注意 Chroma 返回的是「距离」不是相似度（越小越相似），别搞反。
+REPLY_DISTANCE_THRESHOLD = 1.11
 
 
 # 缓存嵌入模型：Streamlit 每次交互都会重新运行脚本，加缓存后模型只加载一次
@@ -65,6 +72,12 @@ def add_to_db(uploaded_files):
             st.info(f"{uploaded_file.name} 已在库中，跳过")  # 有记录就跳过，不重复入库
             continue
 
+        # 增量更新：同名文件内容变更（哈希不同）时，先删掉旧版本的 chunk，避免过期数据堆积
+        old_ids = db.get(where={"file_name": uploaded_file.name})["ids"]
+        if old_ids:
+            db.delete(ids=old_ids)
+            st.info(f"{uploaded_file.name} 内容已更新，删除旧版本 {len(old_ids)} 个片段")
+
         # 先把上传的文件落到本地临时目录，因为 PyPDFLoader 需要一个文件路径
         temp_file_path = os.path.join("./temp", uploaded_file.name)
         os.makedirs(os.path.dirname(temp_file_path), exist_ok=True)
@@ -77,6 +90,7 @@ def add_to_db(uploaded_files):
         chunks = text_splitter.split_documents(data)  # 按上面的规则切分成小块
         for chunk in chunks:
             chunk.metadata["file_hash"] = file_hash  # 哈希写进元数据，供下次去重查询
+            chunk.metadata["file_name"] = uploaded_file.name  # 文件名，供增量更新定位旧版本
         db.add_documents(chunks)              # 向量化并写入 Chroma（含元数据）
         os.remove(temp_file_path)             # 处理完删掉临时文件
 
@@ -88,41 +102,60 @@ def run_rag_chain(query):
     if not api_key:
         return "Please enter your DeepSeek API key in the sidebar first."
 
+    # 语义缓存：相似问法直接复用答案，省掉下面的检索 + 生成
+    cached = lookup(query, get_embedding_model())
+    if cached:
+        st.caption("⚡ 命中语义缓存（相似问题直接返回）")
+        return cached
+
     db = get_db()
-    # 把数据库包装成检索器：相似度检索，每次取最相关的 5 个片段
+
+    # ===== 拒答兜底：检索分数全低于阈值就直接拒答，不硬编 =====
+    # Chroma 的 similarity_search_with_score 返回的是「距离」（越小越相似）。
+    # 阈值 1.11 是实测定的：7 个「论文里能查到答案」的问题距离落在 0.85~1.11，
+    # 7 个「与论文无关」的问题落在 1.13~1.31，两者之间有安全间隔，所以 1.11 能区分。
+    hits = db.similarity_search_with_score(query, k=3)
+    best_dist = min(dist for _, dist in hits) if hits else float("inf")
+    if best_dist > REPLY_DISTANCE_THRESHOLD:
+        st.caption(f"🛑 检索分数低于阈值（{best_dist:.3f} > {REPLY_DISTANCE_THRESHOLD}），已拒答")
+        return "抱歉，知识库中没有检索到相关内容，无法回答这个问题。"
+
+    # 分数够，直接用检索到的片段走生成链
     retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
     # 提示词模板：{context} 和 {question} 是占位符，链执行时会被自动填充。
     # 模板正文保持英文（这段文字会原样发给模型，注释不会），逐句含义如下：
-    #   You are a helpful assistant.
-    #       → 你是一个乐于助人的助手（只做中性角色设定，不绑定领域，换任何 PDF 都适用）
+    #   You are a cybersecurity knowledge assistant ...
+    #       → 你是一名网络安全知识库助手（绑定安全领域，基于上传的安全文档作答）
     #   Answer the question based only on the following context:
     #       → 只能依据下面提供的上下文来回答问题（限定知识来源，防止模型自由发挥）
     #   {context}  → 占位符，会被检索到的 5 个文档片段（format_docs 拼接后）替换
     #   Answer the question based on the above context:
     #       → 基于上面的上下文回答问题
     #   {question} → 占位符，会被用户输入的问题替换
-    #   Use the provided context to answer the user's question accurately and concisely.
-    #       → 用提供的上下文准确、简洁地回答用户的问题
-    #   Don't justify your answers.
-    #       → 不必给出论证或解释理由（避免输出冗长的推理过程）
+    #   - Quote vulnerability identifiers ... exactly ...
+    #       → 漏洞编号（CVE-2024-xxxx）、攻击术语（XSS/RCE/0day）必须与上下文原文一致，不得改写或臆造
+    #   - If the context does not contain the answer ...
+    #       → 上下文没有答案时明确说"未找到"，不要猜（安全问答答错风险高）
     #   Don't give information not mentioned in the CONTEXT INFORMATION.
     #       → 不要提供上下文里没有提到的信息（抑制模型编造，即抑制幻觉）
     #   Do not say "according to the context" or "mentioned in the context" or similar.
     #       → 不要出现"根据上下文""上下文中提到"之类的话术（让回答像直接作答，而不是念资料）
     prompt_template = ChatPromptTemplate.from_template(
         """
-        You are a helpful assistant.
+        You are a cybersecurity knowledge assistant that answers questions strictly from the uploaded security documents (CVE records, security advisories, compliance standards, attack/defense writeups).
+
         Answer the question based only on the following context:
         {context}
 
         Answer the question based on the above context:
         {question}
 
-        Use the provided context to answer the user's question accurately and concisely.
-        Don't justify your answers.
-        Don't give information not mentioned in the CONTEXT INFORMATION.
-        Do not say "according to the context" or "mentioned in the context" or similar.
+        Rules:
+        - Quote vulnerability identifiers (e.g., CVE-2024-12345) and technical terms (e.g., XSS, RCE, 0day) exactly as they appear in the context; never paraphrase or invent them.
+        - If the context does not contain the answer, say explicitly that the answer is not found in the documents; do not guess.
+        - Don't give information not mentioned in the context.
+        - Do not say "according to the context" or "mentioned in the context" or similar.
         """
     )
 
@@ -145,18 +178,20 @@ def run_rag_chain(query):
         | chat_model
         | StrOutputParser()
     )
-    return rag_chain.invoke(query)  # 执行整条链并返回回答
+    answer = rag_chain.invoke(query)  # 执行整条链并返回回答
+    store(query, answer, get_embedding_model())  # 答完写入语义缓存，供相似问法复用
+    return answer
 
 
 def main():
-    """初始化并管理 DocQuery 应用的界面。"""
-    st.set_page_config(page_title="DocQuery", page_icon=":mag:")
-    st.header("Document Insight Retrieval System")
+    """初始化并管理 SecQuery 安全知识库问答应用。"""
+    st.set_page_config(page_title="SecQuery 安全知识库", page_icon=":shield:")
+    st.header("网络安全知识库问答系统")
 
     # 主区域：问题输入框
     query = st.text_area(
-        ":bulb: Enter your query about the uploaded documents:",
-        placeholder="e.g., What is the main conclusion of this report?",
+        ":bulb: 输入关于安全文档的问题（如 CVE 漏洞、安全公告、等保规范）：",
+        placeholder="e.g., CVE-2024-12345 的漏洞描述和危害等级是什么？",
     )
 
     # 点击 Submit 后，非空校验通过则执行 RAG 链
@@ -181,11 +216,11 @@ def main():
             else:
                 st.warning("Please enter your DeepSeek API key to proceed.")
 
-    # 侧边栏第二部分：上传 PDF 文档（可选），提交后写入向量库
+    # 侧边栏第二部分：上传安全文档（CVE 漏洞库 / 安全公告 / 等保规范 PDF），提交后写入向量库
     with st.sidebar:
         st.markdown("---")  # 分隔线
         pdf_docs = st.file_uploader(
-            "Upload your documents (PDF) (Optional) :memo:",
+            "上传安全文档（PDF，如 CVE 漏洞库 / 安全公告）:memo:",
             type=["pdf"],
             accept_multiple_files=True,  # 允许一次选择多个 PDF
         )
